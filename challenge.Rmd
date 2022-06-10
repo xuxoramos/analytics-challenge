@@ -1,0 +1,171 @@
+---
+title: "Challenge for the position of BA Director @ Some company"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Problem description:
+
+Suppose you work at a startup that launched a new credit product a couple years ago, which consists of a credit card, and such a product has been growing continuously since its launch. As usual with credit cards, clients have a monthly payment date. Also, a client is considered to be on default if he is 30+ days late on a payment.
+
+The data science team has developed a model which estimates the probability of a client turning delinquent. A high score indicates a low probability of turning delinquent, and a low score indicates a high probability of turning delinquent.
+
+You are the analyst advising the company on what policies to adopt when accepting new applications for a credit card. You are provided with a csv file with data which might be helpful. What will you recommend to the business leaders based on this? You can make assumptions and describe the logic behind them, in case you find some data elements are missing. Consider general impacts, future analysis, data issues, etc
+
+# Solution
+
+## Data load & overview
+
+We first load the data and take a peek at it:
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(plotly)
+library(lubridate)
+
+data = read_csv('./data/raw/analytics_challenge.csv')
+head(data, 50)
+```
+
+## Assumptions about the data
+
+We will assume the columns hold the following data:
+
+1. **`origination_month`**: the year and month this particular client was originated.
+2. **`score_band_v2`**: the score given to this client by the model the data science team developed.
+3. **`nb_clients`**: the ID of the client to which the score on the `score_band_v2` column belongs.
+4. **`months_since_origination`**: the number of months that have passed since origination corresponding for the number of `clients_on_default`.
+5. **`clients_on_default`**: the number of clients with delinquent debt that correspond to the number of `months_since_origination`
+
+**These assumptions imply that we have 2 tables**, describing related phenomena, but at very different aggregation levels, fused into a single one. We will separate them into:
+
+1. client sample data: columns 1, 2 and 3, describing clients, their date of origination, and the score they originated with.
+2. clients on default: columns 4 and 5, describing the number of clients who have defaulted according to the number of months since origination.
+
+```{r message=FALSE, warning=FALSE}
+
+client_sample = data |> 
+  select(origination_month, score_band_v2, nb_clients) |> 
+  distinct() |> 
+  mutate(origination_date = as.Date(str_c(origination_month, '-01')),
+         origination_year = as_factor(year(origination_date)), 
+         origination_month = as_factor(month(origination_date)), 
+         score_band_v2 = as_factor(score_band_v2), 
+         client_id = as_factor(nb_clients))
+
+clients_on_default = data |> 
+  select(months_since_origination, clients_on_default) |>
+  mutate(months_since_origination = as_factor(months_since_origination))
+
+head(client_sample)
+head(clients_on_default)
+```
+
+We have deduplicated the client sample data and kept unique combinations of its 3 columns, since there are no repeating `nb_clients`, which we will take to be the ID.
+
+## Analysis of clients on default
+
+We have several observations for every number of months from 0 to 15, the latter of which we will assume is the limit after which the debts are deemed noncollectable and sold off to a collection company.
+
+We should also assume that the column `clients_on_default` **is cumulative**, so adding up all observations for each of the number of months since origination will only cause inflated (and wrong) numbers, as a client who has gone delinquent appearing on month 4, will keep appearing until they settle or restructure. To avoid inflated numbers, we will use averages, maximum and minimum.
+
+```{r fig.width=15, message=FALSE, warning=FALSE}
+avg_clients_on_default_per_months_since_origination = clients_on_default |>
+  group_by(months_since_origination) |>
+  summarise(avg_clients_on_default = mean(clients_on_default),
+            max_clients_on_default = max(clients_on_default),
+            min_clients_on_default = min(clients_on_default))
+
+avg_clients_on_default_per_months_since_origination
+
+fig <- clients_on_default |> 
+  plot_ly(x = ~months_since_origination, 
+          y = ~clients_on_default,
+          split = ~months_since_origination,
+          type = 'violin',
+          box = list(visible = T),
+          meanline = list(visible = T)
+          ) 
+
+fig <- fig |>
+  layout(
+    xaxis = list(title = "Months since origination"),
+    yaxis = list(title = "Number of clients on default", zeroline = F)
+    )
+
+fig
+
+```
+We can see that, on average (as little informative as they usually are), every additional month since the credit was originated adds around 80 defaulting clients. This is really a low number, but considering the following:
+
+1. that the data across the observations for the same number of months since origination may be for multiple periods or quarters, and
+2. that, according to Pareto Principle, 80% of your delinquent debt could be attributed to 20% of your clients,
+
+Then we must not use averages and observe the maximum across these months.
+
+```{r message=FALSE, warning=FALSE}
+fig = avg_clients_on_default_per_months_since_origination |>
+  plot_ly(x=~months_since_origination, y=~avg_clients_on_default, type = 'scatter', mode='lines', name='Average') |>
+  add_ribbons(ymin=~min_clients_on_default, ymax=~max_clients_on_default, name='Min, Max') |>
+  layout(
+    xaxis = list(title = "Months since origination"),
+    yaxis = list(title = "Number of clients on default", zeroline = F)
+    )
+
+fig
+```
+
+This maximum reveals more information, with which we could tell the following story:
+
+1. Clients that default on their debt grow at a rate of 400 for each month added since their origination, for up to 6 months
+2. After the 6-mo mark, ~500 clients restructure. We have to assume that these clients are taken off the delinquency status and change status to "restructuring".
+3. At the 9-mo mark, even more clients either settle their outstanding balance, or restructure, up to the 12-mo mark. This restructuring takes off delinquency over 1000 clients.
+4. After the 12-mo mark, less than 500 clients remain delinquent, whose debt we can assume is deemed noncollectable and sold off to collection companies.
+
+Let's see now if these patterns also hold for individual clients on the `clients_sample_data`.
+
+## Analysis of sample of clients
+
+We have assumed that the first 3 columns of the original data is a sample of the clients, so we will attempt to create a dataset very similar to the one in the previous section, with data from this sample.
+
+### Translation of scores to delinquency
+
+We explore the distribution of scores to establish a threshold for delinquency.
+
+
+```{r message=FALSE, warning=FALSE}
+
+fig = client_sample |>
+  plot_ly(x = ~score_band_v2) |> add_histogram()
+
+fig
+```
+
+We can observe a uniform distribution, which does not say anything. The fact that we have exactly 12 instances of each score tells us that it may have something to do with the 12 months of the year.
+
+We are going to assume, then, that the score for probability of default is updated monthly, perhaps after issuing the credit card statement. This will affect our analysis of the first dataset in the previous section, but for all purposes, the dataset with clients sample cannot be used for further analysis. As the popular saying in statistics goes:
+
+> "No findings are also findings"
+
+So, the analysis of this file will stop here.
+
+## Recommendations to credit origination policy
+
+1. Lower the cut point of the scoring model to flag as potentially bad clients those with score 1 to 3. Automatically reject those on 1 and 2, and pass those scored with 3 on to human-in-the-loop review.
+    - Though this might have an immediate impact on revenue due to decreased origination, the savings on debt restructure 6 to 9 months later will more than compensate.
+2. To stave off impact of (1), work with the data science team to incorporate a **model interpretability** step in the credit score generation, so we can share with the prospect client the reason why their application was declined and invite them to reapply once the relevant variable has been corrected. This will bring back clients that were rejected by our more strict score threshold.
+    - This project should have all company eyes on it, especially the compliance office, since it may be used by competitors to reverse-engineer part of our credit scoring model.
+    - To mitigate this risk, a design team should take the output of the model interpretability project, and _wrap it_ around an effective UX layer, so it can be understood by operations and communicated to our clients effectively.
+    - To dramatically increase our brand goodwill, the organization could start a marketing campaign arguing that our credit cards are "ethically originated".
+3. Offer a tiered system that rewards clients based on punctuality of payments for the first 6 months, and then switch it to rewards based on expenditure after this period.
+    - Work with current points-based reward systems to avoid the TCO of running and managing this program.
+    - But add incentives that are exclusive to us nonetheless. This can be done through marketing without changes in technology.
+4. Reduce the noncollectable threshold from 15 months to 12. According to the data and the assumptions made, there is little the organization can, and is willing to do about delinquent debt that is older than 12 months. This will allow taking bad debt off the books earlier and leave operational capacity for enrolling more clients.
+
+### Recommendation based on experience, not on data
+
+During the development of "Cool Project 1", described in the PPT of the challenge, we found that allowing and incentivizing partial payments to outstanding balance, and focusing on their frequency rather than puctuality, resulted in the emergence of a feature we called "willingness to pay". This feature was later used during the pandemic to stave off COVID's economic consequences, both for the business and for the credit agents.
+
+  - Though implementing this could imply radical changes to the business model of the organization.
+  - Perhaps another product to explore this idea and leave our credit card business alone?
